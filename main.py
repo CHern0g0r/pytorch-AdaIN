@@ -1,15 +1,17 @@
 import argparse
 from pathlib import Path
+from distutils.dir_util import copy_tree
 
 import torch
 import torch.nn as nn
 from PIL import Image
 from torchvision import transforms
 from torchvision.utils import save_image
+from tqdm import tqdm
+import shutil
 
 import net
 from function import adaptive_instance_normalization, coral
-
 
 def test_transform(size, crop):
     transform_list = []
@@ -39,8 +41,7 @@ def style_transfer(vgg, decoder, content, style, alpha=1.0,
     feat = feat * alpha + content_f * (1 - alpha)
     return decoder(feat)
 
-
-if __name__ == '__main__':
+def get_parser():
     parser = argparse.ArgumentParser()
     # Basic options
     parser.add_argument('--content', type=str,
@@ -67,7 +68,7 @@ if __name__ == '__main__':
                         help='do center crop to create squared image')
     parser.add_argument('--save_ext', default='.jpg',
                         help='The extension name of the output image')
-    parser.add_argument('--output', type=str, default='output',
+    parser.add_argument('--output', type=str, default='test_output',
                         help='Directory to save the output image(s)')
 
     # Advanced options
@@ -80,6 +81,11 @@ if __name__ == '__main__':
         '--style_interpolation_weights', type=str, default='',
         help='The weight for blending the style of multiple style images')
 
+    return parser
+
+if __name__ == '__main__':
+    parser = get_parser()
+
     args = parser.parse_args()
 
     do_interpolation = False
@@ -90,28 +96,14 @@ if __name__ == '__main__':
     output_dir.mkdir(exist_ok=True, parents=True)
 
     # Either --content or --contentDir should be given.
-    assert (args.content or args.content_dir)
-    if args.content:
-        content_paths = [Path(args.content)]
-    else:
-        content_dir = Path(args.content_dir)
-        content_paths = [f for f in content_dir.glob('*')]
+    assert (args.content)
+    content_path = Path(args.content)
 
     # Either --style or --styleDir should be given.
-    assert (args.style or args.style_dir)
-    if args.style:
-        style_paths = args.style.split(',')
-        if len(style_paths) == 1:
-            style_paths = [Path(args.style)]
-        else:
-            do_interpolation = True
-            assert (args.style_interpolation_weights != ''), \
-                'Please specify interpolation weights'
-            weights = [int(i) for i in args.style_interpolation_weights.split(',')]
-            interpolation_weights = [w / sum(weights) for w in weights]
-    else:
-        style_dir = Path(args.style_dir)
-        style_paths = [f for f in style_dir.glob('*')]
+    assert (args.style)
+    # style_path = args.style.split(',')
+    # if len(style_path) == 1:
+    style_path = Path(args.style)
 
     decoder = net.decoder
     vgg = net.vgg
@@ -129,37 +121,51 @@ if __name__ == '__main__':
     content_tf = test_transform(args.content_size, args.crop)
     style_tf = test_transform(args.style_size, args.crop)
 
-    for content_path in content_paths:
-        if do_interpolation:  # one content image, N style image
-            style = torch.stack([style_tf(Image.open(str(p))) for p in style_paths])
-            content = content_tf(Image.open(str(content_path))) \
-                .unsqueeze(0).expand_as(style)
-            style = style.to(device)
-            content = content.to(device)
-            with torch.no_grad():
-                output = style_transfer(vgg, decoder, content, style,
-                                        args.alpha, interpolation_weights)
-            output = output.cpu()
-            output_name = output_dir / '{:s}_interpolation{:s}'.format(
-                content_path.stem, args.save_ext)
-            save_image(output, str(output_name))
+    styles = []
 
-        else:  # process one content and one style
-            for style_path in style_paths:
-                content_img = Image.open(str(content_path))
+    for style_img in style_path.iterdir():
+        if style_img.suffix == '.jpg':
+            styles.append(style_tf(Image.open(str(style_img))).unsqueeze(0))
+
+    print(f'Number of styles {len(styles)}')
+
+    cur_style = styles[0]
+
+    topil = transforms.ToPILImage()
+
+    style_idx = 0
+
+    for directory in content_path.iterdir():
+        dir_name = directory.name
+
+        new_directory = output_dir / dir_name
+        new_directory.mkdir(exist_ok=True, parents=True)
+
+        for target in directory.iterdir():
+            if target.is_dir():
+                inner_dir_name = target.name
+                new_inner_path = new_directory / inner_dir_name
+                copy_tree(str(target), str(new_inner_path))
+            elif target.suffix == '.png':
+                content_name = target.name
+                output_path = new_directory / content_name
+
+                cur_style = styles[style_idx % len(styles)]
+                cur_style = cur_style.to(device)
+                
+                content_img = Image.open(str(target))
                 if content_img.mode == 'L':
                     content_img = content_img.convert('RGB')
                 content = content_tf(content_img)
-                style = style_tf(Image.open(str(style_path)))
-                if args.preserve_color:
-                    style = coral(style, content)
-                style = style.to(device).unsqueeze(0)
                 content = content.to(device).unsqueeze(0)
                 with torch.no_grad():
-                    output = style_transfer(vgg, decoder, content, style,
-                                            args.alpha)
-                output = output.cpu()
+                    output = style_transfer(
+                        vgg, decoder, content, cur_style)
 
-                output_name = output_dir / '{:s}_stylized_{:s}{:s}'.format(
-                    content_path.stem, style_path.stem, args.save_ext)
-                save_image(output, str(output_name))
+                cur_style = cur_style.to('cpu')
+                style_idx += 1
+                
+                output = output.cpu()
+                save_image(output, str(output_path))
+
+
